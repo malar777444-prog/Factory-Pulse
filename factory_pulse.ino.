@@ -1,0 +1,132 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+
+// WiFi & Google Script Config
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASSWORD";
+String serverName = "YOUR_GOOGLE_SCRIPT_URL_HERE";
+
+// Pin Definitions
+#define IN1_PIN 26
+#define IN2_PIN 27
+#define IN3_PIN 25
+#define IN4_PIN 33
+
+#define VOLTAGE_PIN 35
+#define CURRENT_PIN 34
+#define IR_PIN 18
+#define TEMP_PIN 32 // LM35 Analog read
+
+// Carbon Calculation Constants
+// India grid average: ~0.716 kg CO2 per kWh = 0.716 grams CO2 per Watt-hour
+const float EMISSION_FACTOR_G_PER_WH = 0.716; 
+float totalCarbonGrams = 0.0; // Running total of carbon emissions
+
+int productCount = 0;
+unsigned long lastProductTime = 0;
+bool isConveyorRunning = true;
+
+// Motor Control Logic
+void setConveyorState(bool enable) {
+  if (enable) {
+    digitalWrite(IN1_PIN, HIGH);
+    digitalWrite(IN2_PIN, LOW);
+    digitalWrite(IN3_PIN, HIGH);
+    digitalWrite(IN4_PIN, LOW);
+    isConveyorRunning = true;
+  } else {
+    digitalWrite(IN1_PIN, LOW);
+    digitalWrite(IN2_PIN, LOW);
+    digitalWrite(IN3_PIN, LOW);
+    digitalWrite(IN4_PIN, LOW);
+    isConveyorRunning = false;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // Motor Drivers
+  pinMode(IN1_PIN, OUTPUT);
+  pinMode(IN2_PIN, OUTPUT);
+  pinMode(IN3_PIN, OUTPUT);
+  pinMode(IN4_PIN, OUTPUT);
+  
+  // Sensors
+  pinMode(IR_PIN, INPUT);
+  
+  // Start Conveyor Motors
+  setConveyorState(true);
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected!");
+}
+
+void loop() {
+  // 1. Detect Products via IR Sensor
+  if (digitalRead(IR_PIN) == LOW) { 
+    productCount++;
+    lastProductTime = millis();
+    delay(300); // Debounce delay
+  }
+
+  // 2. Scheduled Data Upload & Logic Check (Every 10 Seconds)
+  static unsigned long lastUpload = 0;
+  if (millis() - lastUpload > 10000) {
+    lastUpload = millis();
+
+    // Read Voltage and Current
+    float voltage = analogRead(VOLTAGE_PIN) * (3.3 / 4095.0) * 5.0; 
+    float current = (analogRead(CURRENT_PIN) * (3.3 / 4095.0) - 1.65) / 0.066; 
+    if (current < 0) current = 0; 
+
+    // Read LM35 Temperature Sensor
+    int rawTemp = analogRead(TEMP_PIN);
+    float tempVoltage = (rawTemp / 4095.0) * 3.3; 
+    float tempC = tempVoltage * 100.0;            
+
+    // 3. Waste & Carbon Emission Logic
+    float powerW = voltage * current; 
+    float energyWh = powerW * (10.0 / 3600.0); // Energy consumed in the last 10 seconds
+    totalCarbonGrams += (energyWh * EMISSION_FACTOR_G_PER_WH);
+
+    String machineState = "OFF";
+    if (isConveyorRunning) {
+      if (millis() - lastProductTime > 15000) {
+        machineState = "IDLE_WASTE"; 
+      } else {
+        machineState = "RUNNING";
+      }
+    }
+
+    // Print to Serial for Debugging
+    Serial.printf("V: %.2f | I: %.2f | Temp: %.2f C | Products: %d | State: %s | Carbon(g): %.4f\n", 
+                   voltage, current, tempC, productCount, machineState.c_str(), totalCarbonGrams);
+
+    // 4. Push Payload to Google Sheets
+    if (WiFi.status() == WL_CONNECTED) {
+      HTTPClient http;
+      http.begin(serverName);
+      http.addHeader("Content-Type", "application/json");
+
+      // Appended "carbon" to the JSON payload
+      String jsonPayload = "{\"voltage\":" + String(voltage, 2) + 
+                           ",\"current\":" + String(current, 2) + 
+                           ",\"temperature\":" + String(tempC, 2) + 
+                           ",\"products\":" + String(productCount) + 
+                           ",\"state\":\"" + machineState + "\"" +
+                           ",\"carbon\":" + String(totalCarbonGrams, 4) + "}";
+
+      int httpResponseCode = http.POST(jsonPayload);
+      Serial.print("Data Upload Status Code: ");
+      Serial.println(httpResponseCode); // 200 = OK
+      http.end();
+    }
+  }
+}
